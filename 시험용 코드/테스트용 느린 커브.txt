@@ -1,0 +1,415 @@
+#include <avr/io.h>
+#include <util/delay.h>
+#include <avr/interrupt.h>
+#include <stdio.h>
+
+
+#define MOTOR_PORT		PORTD
+#define MOTOR_PORT_DDR	DDRD
+
+#define SENSOR_PORT		PINC
+
+volatile int start_sign = 0, stop_sign = 0, turn_sign = 0;
+volatile int time = 200, n = 5, zero_forward, zero_curved;
+volatile int temp = 0;
+
+int t = 6250;
+
+
+ISR(TIMER0_OVF_vect)
+{
+		temp++;
+
+	if(temp == t)
+	{
+		temp = 0;
+		turn_sign = 0;
+	}
+}
+
+void timer_setting()
+{
+	TCCR0 = 0x01;
+	TCNT0 = 0x00;
+	TIMSK = 0x01;
+	TIFR = 0xFF;
+}
+
+
+void port_init(void)
+{
+	PORTA = 0x00;
+	DDRA  = 0xFF;
+	PORTB = 0x00;
+	DDRB  = 0x00;
+	PORTC = 0x00;			//PORTC is for sensor (right 10 pins)
+	DDRC  = 0x00;
+	PORTD = 0x00;			//PORTD is for motor driver (left 10 pins)	PD0, 1 : INT0, 1
+	DDRD  = 0xFF;			//PORTD is all used for output
+	PORTE = 0x00;
+	DDRE  = 0x02;			//PORTE 의 Rx단 설정
+	PORTF = 0x00;
+	DDRF  = 0x00;
+	PORTG = 0x00;
+	DDRG  = 0x03;			//PORTG 0, 1번 -> switch 5, 6
+}
+
+void init_devices(void)
+{
+	cli(); //disable all interrupts
+	XDIV  = 0x00; //xtal divider
+	XMCRA = 0x00; //external memory
+	port_init();
+	
+	UBRR0H = 0;
+	UBRR0L = 103;
+	
+	UCSR0B = 0x18;
+	
+	MCUCR = 0x00;						//INT0, 1 is low level interrupt
+	EICRA = 0x00; //extended ext ints	// all interrupt will act with low level interrupt
+	EICRB = 0x0A; //extended ext ints	// all interrupt will act with low level interrupt
+	EIMSK = 0x30;
+	TIMSK = 0x00; //timer interrupt sources
+	ETIMSK = 0x00; //extended timer interrupt sources
+	sei(); //re-enable interrupts
+	//all peripherals are now initialized
+}
+
+
+/* Stepping Motor derive---------------------------*/
+unsigned char  LEFTmotorOneClock(unsigned char step, char dir)
+{	
+	step = step & 0x0f;		//반대쪽 바퀴는 건들지 않도록
+	if(dir){
+		switch(step){
+			case 0x09: step=0x01; break;	//0b0000 1001 : 왼쪽모터 A, 왼쪽모터 /B
+			case 0x01: step=0x03; break;	//0b0000 0001 : 왼쪽모터 A
+			case 0x03: step=0x02; break;	//0b0000 0011 : 왼쪽모터 A, 왼쪽모터 B
+			case 0x02: step=0x06; break;	//0b0000 0010 : 왼쪽모터 B
+			case 0x06: step=0x04; break;	//0b0000 0110 : 왼쪽모터 /A, 왼쪽모터 B
+			case 0x04: step=0x0c; break;	//0b0000 0100 : 왼쪽모터 /A
+			case 0x0c: step=0x08; break;	//0b0000 1100 : 왼쪽모터 /B, 왼쪽모터 /A
+			case 0x08: step=0x09; break;	//0b0000 1000 : 왼쪽모터 /B
+			default: step=0x0c; break;		
+		}
+	}else{
+		switch(step){
+			case 0x09: step=0x08; break;
+			case 0x01: step=0x09; break;
+			case 0x03: step=0x01; break;
+			case 0x02: step=0x03; break;
+			case 0x06: step=0x02; break;
+			case 0x04: step=0x06; break;
+			case 0x0c: step=0x04; break;
+			case 0x08: step=0x0c; break;
+			default: step=0x0c; break;
+		}
+	}
+	return step;
+
+}
+
+
+/* Stepping Motor derive---------------------------*/
+unsigned char  RIGHTmotorOneClock(unsigned char step, char dir)
+{	
+	step = step & 0xf0;		//반대쪽 바퀴는 건들지 않도록
+	if(dir){
+		switch(step){
+			case 0x90: step=0x10; break;
+			case 0x10: step=0x30; break;
+			case 0x30: step=0x20; break;
+			case 0x20: step=0x60; break;
+			case 0x60: step=0x40; break;
+			case 0x40: step=0xc0; break;
+			case 0xc0: step=0x80; break;
+			case 0x80: step=0x90; break;
+			default: step=0xc0; break;
+		}
+	}else{
+		switch(step){
+			case 0x90: step=0x80; break;
+			case 0x10: step=0x90; break;
+			case 0x30: step=0x10; break;
+			case 0x20: step=0x30; break;
+			case 0x60: step=0x20; break;
+			case 0x40: step=0x60; break;
+			case 0xc0: step=0x40; break;
+			case 0x80: step=0xc0; break;
+			default: step=0xc0; break;
+		}
+	}
+	return step;
+}
+
+unsigned char FastRIGHTmotorOneClock(unsigned char step, char dir)
+{
+	step = step & 0x0f;		//반대쪽 바퀴는 건들지 않도록
+	if(dir){
+		switch(step){
+//
+			case 0x09: step=0x03; break;	//0b0000 1001 : 왼쪽모터 A, 왼쪽모터 /B
+			case 0x03: step=0x06; break;	//0b0000 0011 : 왼쪽모터 A, 왼쪽모터 B
+			case 0x06: step=0x0c; break;	//0b0000 0110 : 왼쪽모터 /A, 왼쪽모터 B
+			case 0x0c: step=0x09; break;	//0b0000 1100 : 왼쪽모터 /B, 왼쪽모터 /A
+			default: step=0x0c; break;		
+		}
+	}else{
+		switch(step){
+			case 0x09: step=0x0c; break;
+			case 0x03: step=0x09; break;
+			case 0x06: step=0x03; break;
+			case 0x0c: step=0x06; break;
+			default: step=0x0c; break;
+		}
+	}
+	return step;
+}
+
+unsigned char  FastRIGHTmotor(unsigned char step, char dir)
+{	
+	step = step & 0xf0;		//반대쪽 바퀴는 건들지 않도록
+	if(dir){
+		switch(step){
+			case 0x90: step=0x30; break;
+			case 0x30: step=0x60; break;
+			case 0x60: step=0xc0; break;
+			case 0xc0: step=0x90; break;
+			default: step=0xc0; break;
+		}
+	}else{
+		switch(step){
+			case 0x90: step=0xc0; break;
+			case 0x30: step=0x90; break;
+			case 0x60: step=0x30; break;
+			case 0xc0: step=0x60; break;
+			default: step=0xc0; break;
+		}
+	}
+	return step;
+}
+
+
+void delay(int n)				//원래 delay = 400;
+{
+	volatile int i,j;
+	for(i=1;i<n;i++)
+	{
+    	for(j=1;j<time;j++);
+	}
+}
+
+void main(void)
+{
+
+unsigned char sensor = 0x0f;
+unsigned char sen[2] = {0, 0};
+int i, rx;
+volatile unsigned char stepleft=0, stepright=0;
+unsigned char FND_SEG[10] = {0x3F, 0X06, 0x5B, 0X4F, 0X66, 0X6D, 0X7C, 0X07, 0X7F, 0X67}; 
+
+init_devices();
+ 	
+MOTOR_PORT_DDR = 0xff;
+
+time = 10;
+n = 50;
+
+while(1)
+while(start_sign)
+{
+	zero_forward = 1000 / time;
+	zero_curved = 1500 / time;
+	
+	sensor = SENSOR_PORT & 0x0F;
+	
+
+		switch(sensor){
+			case 0x0f: 	//	Sensor 1, 2, 3, 4 On -> 전부 흰색 -> 직진	//"15"	□□□□
+						stepright = RIGHTmotorOneClock(stepright, 1);
+					    stepleft = LEFTmotorOneClock(stepleft, 0);
+						delay(n);
+						PORTB= 0x00;
+						break;
+			case 0x0b:	//	Sensor 3 OFF -> Turn Right					//"11"	□□■□
+						stepleft = LEFTmotorOneClock(stepleft, 0);
+					    delay(n);
+					    PORTB = 0x02;
+						break;
+			case 0x0d:  //	Sensor 2 OFF -> Turn Left					//"13"	□■□□
+		    	 		stepright = RIGHTmotorOneClock(stepright, 1);
+					    delay(n);
+						PORTB = 0x01;
+					    break;		
+						
+			case 0x03:	//	"3" ■■□□
+						//turn_sign = 1;
+						stepleft = LEFTmotorOneClock(stepleft, 0);
+					    delay(n);
+					    PORTB= 0x02;
+						break;
+						
+			case 0x0c:	//	"12"	□□■■
+						//turn_sign = -1;
+						stepright = RIGHTmotorOneClock(stepright, 1);
+					    delay(n);
+						PORTB= 0x01;
+					    break;		
+
+			case 0x07:	//"7"	0111	□□□■
+						turn_sign--;
+						stepright = RIGHTmotorOneClock(stepright, 1);
+					    stepleft = LEFTmotorOneClock(stepleft, 0);
+						delay(n);
+						PORTB= 0x00;
+						break;
+			case 0x0a:	//"10"	1010	■□■□
+						turn_sign++;
+						stepright = RIGHTmotorOneClock(stepright, 1);
+					    stepleft = LEFTmotorOneClock(stepleft, 0);
+						delay(n);
+						PORTB= 0x00;
+						break;
+			case 0x0e:	//"14"	1110	■□□□
+						turn_sign++;
+						stepright = RIGHTmotorOneClock(stepright, 1);
+					    stepleft = LEFTmotorOneClock(stepleft, 0);
+						delay(n);
+						PORTB= 0x00;
+						break;
+			case 0x05:	//"5"	0101	□■□■
+						turn_sign--;
+						stepright = RIGHTmotorOneClock(stepright, 1);
+					    stepleft = LEFTmotorOneClock(stepleft, 0);
+						delay(n);
+						PORTB= 0x00;
+						break;				
+			case 0x06:	//"6"	■□□■
+						stop_sign++;
+						
+						if(stop_sign >= 3)
+						{
+							start_sign = 0;
+							stop_sign = 0;
+						}
+						
+						while((sensor != 0x0f) && (sensor != 0x0b) && (sensor != 0x0d))
+						{
+							if(sensor == 0x0b)
+							{
+								sensor = SENSOR_PORT & 0x0F;
+								stepleft = LEFTmotorOneClock(stepleft, 0);
+							    delay(n);
+					    		PORTB= 0x02;
+								MOTOR_PORT = stepleft|stepright;
+							}
+							else if(sensor == 0x0d)
+							{
+								sensor = SENSOR_PORT & 0x0F;
+								stepright = RIGHTmotorOneClock(stepright, 1);
+							    delay(n);
+								PORTB= 0x01;
+								MOTOR_PORT = stepleft|stepright;
+							}
+							else
+							{
+								sensor = SENSOR_PORT & 0x0F;
+								stepright = RIGHTmotorOneClock(stepright, 1);
+								stepleft = LEFTmotorOneClock(stepleft, 0);
+								delay(n);
+								PORTB= 0x00;
+								MOTOR_PORT = stepleft|stepright;
+							}							
+						}
+						break;
+																		
+			case 0x00:	//"0"	■■■■
+						//delay(5);
+						if(turn_sign < -3)
+						{
+							for(i = 0; i < 100; i++)	
+							{
+								stepright = RIGHTmotorOneClock(stepright, 1);
+							    stepleft = LEFTmotorOneClock(stepleft, 0);
+								delay(zero_forward);			//time * zero_forward = 1000
+								PORTB= 0x00;
+								MOTOR_PORT = stepleft|stepright;
+
+	PORTE = 0x04;
+	PORTA = 0x01;
+	PORTE = 0x08;
+	PORTA = FND_SEG[turn_sign + 3];
+	delay(1);
+
+							}
+							for(i = 0; i < 400; i++)
+							{
+								stepleft = LEFTmotorOneClock(stepleft, 0);
+								delay(zero_curved);			//time * zero_curved = 1400, 1500
+								PORTB= 0x02;
+								MOTOR_PORT = stepleft|stepright;
+
+	PORTE = 0x04;
+	PORTA = 0x01;
+	PORTE = 0x08;
+	PORTA = FND_SEG[turn_sign + 3];
+	delay(1);
+
+							}
+							turn_sign = 0;
+						}
+					
+
+						else if(turn_sign > 3)
+						{
+							for(i = 0; i < 100; i++)
+							{
+								stepright = RIGHTmotorOneClock(stepright, 1);
+							    stepleft = LEFTmotorOneClock(stepleft, 0);
+								delay(zero_forward);			//time * zero_forward = 1000
+								PORTB= 0x00;
+								MOTOR_PORT = stepleft|stepright;
+							}
+							for(i = 0; i < 400; i++)
+							{
+								stepright = RIGHTmotorOneClock(stepright, 1);
+								delay(zero_curved);			//time * zero_curved = 1400, 1500
+								PORTB= 0x01;
+								MOTOR_PORT = stepleft|stepright;
+							}
+							turn_sign = 0;
+						}
+						
+						else
+							for(i = 0; i < 100; i++)
+							{
+								stepright = RIGHTmotorOneClock(stepright, 1);
+							    stepleft = LEFTmotorOneClock(stepleft, 0);
+								delay(n);
+								PORTB= 0x00;
+								MOTOR_PORT = stepleft|stepright;
+							}
+						
+						
+						break;				
+
+			default:    //	When car meets corner
+						stepright = RIGHTmotorOneClock(stepright, 1);
+					    stepleft = LEFTmotorOneClock(stepleft, 0);
+						delay(n);
+						PORTB= 0x00;
+						break;
+		}		
+		MOTOR_PORT = stepleft|stepright;		
+ }
+
+}
+
+ISR(INT4_vect)
+{
+	start_sign = 1;
+	stop_sign = 0;
+	turn_sign = 0;
+}
+

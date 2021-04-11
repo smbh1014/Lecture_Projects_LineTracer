@@ -1,0 +1,299 @@
+#include <avr/io.h>
+#include <util/delay.h>
+#include <avr/interrupt.h>
+#include <stdio.h>
+
+//모터드라이버와 연결되는 포트
+#define MOTOR_PORT		PORTD
+#define MOTOR_PORT_DDR	DDRD
+//센서부와 연결되는 포트
+#define SENSOR_PORT		PINC
+
+volatile int start_sign = 0, stop_sign = 0, turn_sign = 0;
+volatile int time = 200, n = 5, zero_forward, zero_curved, ref;
+
+void port_init(void)
+{
+	PORTA = 0x00;
+	DDRA = 0x00;
+	PORTB = 0x00;
+	DDRB = 0x00;
+	PORTC = 0x00;			//PORTC is for sensor (right 10 pins)
+	DDRC = 0x00;			//all used for input
+	PORTD = 0x00;			//PORTD is for motor driver (left 10 pins)	PD0, 1 : INT0, 1
+	DDRD = 0xFF;			//all used for output
+	PORTE = 0x00;			//PORTE is for USART and interrupt switch
+	DDRE = 0x02;			//Rx is for input, Tx is for output, INT4 Switch for input
+	PORTF = 0x00;
+	DDRF = 0x00;
+	PORTG = 0x00;			
+	DDRG = 0x03;			//PORTG 0, 1번 -> switch 5, 6 <계획이랑 달라져서 사용하지 않음>
+}
+
+void init_devices(void)
+{
+	cli(); //disable all interrupts
+	XDIV = 0x00; //xtal divider	(크리스탈 분주제어 레지스터 : 최상위 비트가 0이면 CPU 클락은 안 바뀜)
+	XMCRA = 0x00; //external memory
+	port_init();
+
+	UBRR0H = 0;
+	UBRR0L = 103;	//USART Baud Rate = 9600(Baud)
+
+	UCSR0B = 0x18;	//송, 수신완료 인터럽트 enable
+
+	MCUCR = 0x00;						//INT0, 1 is low level interrupt
+	EICRA = 0x00; //extended ext ints	// all interrupt will act with low level interrupt
+	EICRB = 0x0A; //extended ext ints	// all interrupt will act with low level interrupt
+	EIMSK = 0x30; //INT4, INT5 사용
+	TIMSK = 0x00; //timer interrupt sources
+	ETIMSK = 0x00; //extended timer interrupt sources
+	sei(); //re-enable interrupts
+		   //all peripherals are now initialized
+}
+
+
+/* Stepping Motor derive---------------------------*/
+unsigned char  LEFTmotorOneClock(unsigned char step, char dir)
+{
+	step = step & 0x0f;		//반대쪽 바퀴는 건들지 않도록
+	if (dir) {		//CCW 정방향 회전
+		switch (step) {
+		case 0x09: step = 0x01; break;	//0b0000 1001 : 왼쪽모터 A, 왼쪽모터 /B
+		case 0x01: step = 0x03; break;	//0b0000 0001 : 왼쪽모터 A
+		case 0x03: step = 0x02; break;	//0b0000 0011 : 왼쪽모터 A, 왼쪽모터 B
+		case 0x02: step = 0x06; break;	//0b0000 0010 : 왼쪽모터 B
+		case 0x06: step = 0x04; break;	//0b0000 0110 : 왼쪽모터 /A, 왼쪽모터 B
+		case 0x04: step = 0x0c; break;	//0b0000 0100 : 왼쪽모터 /A
+		case 0x0c: step = 0x08; break;	//0b0000 1100 : 왼쪽모터 /B, 왼쪽모터 /A
+		case 0x08: step = 0x09; break;	//0b0000 1000 : 왼쪽모터 /B
+		default: step = 0x0c; break;
+		}
+	}
+	else {			//CW 역방향 회전
+		switch (step) {
+		case 0x09: step = 0x08; break;
+		case 0x01: step = 0x09; break;
+		case 0x03: step = 0x01; break;
+		case 0x02: step = 0x03; break;
+		case 0x06: step = 0x02; break;
+		case 0x04: step = 0x06; break;
+		case 0x0c: step = 0x04; break;
+		case 0x08: step = 0x0c; break;
+		default: step = 0x0c; break;
+		}
+	}
+	return step;
+
+}
+
+
+/* Stepping Motor derive---------------------------*/
+unsigned char  RIGHTmotorOneClock(unsigned char step, char dir)
+{
+	step = step & 0xf0;		//반대쪽 바퀴는 건들지 않도록
+	if (dir) {		//CCW 역방향 회전
+		switch (step) {
+		case 0x90: step = 0x10; break;
+		case 0x10: step = 0x30; break;
+		case 0x30: step = 0x20; break;
+		case 0x20: step = 0x60; break;
+		case 0x60: step = 0x40; break;
+		case 0x40: step = 0xc0; break;
+		case 0xc0: step = 0x80; break;
+		case 0x80: step = 0x90; break;
+		default: step = 0xc0; break;
+		}
+	}
+	else {			//CW 정방향 회전
+		switch (step) {
+		case 0x90: step = 0x80; break;
+		case 0x10: step = 0x90; break;
+		case 0x30: step = 0x10; break;
+		case 0x20: step = 0x30; break;
+		case 0x60: step = 0x20; break;
+		case 0x40: step = 0x60; break;
+		case 0xc0: step = 0x40; break;
+		case 0x80: step = 0xc0; break;
+		default: step = 0xc0; break;
+		}
+	}
+	return step;
+}
+
+void delay(int n)				//원래 delay = 400;
+{								//n * time만큼 delay
+	volatile int i, j;
+	for (i = 1; i<n; i++)
+	{
+		for (j = 1; j<time; j++);
+	}
+}
+
+void main(void)
+{
+
+	unsigned char sensor = 0x0f;	
+	int i, rx, for_curve_times;
+	volatile unsigned char stepleft = 0, stepright = 0;
+
+	init_devices();
+
+	MOTOR_PORT_DDR = 0xff;		//모터드라이버에 해당하는 포트 출력으로 설정
+
+	//딜레이 속도 조절
+	time = 10;
+	n = 500 / time;
+	ref = 500;
+
+	while (1)
+		while (start_sign)		//센서 인식 및 모터 동작
+		{
+			zero_forward = 1000 / time;					//교차로 진입시 모터 딜레이
+			zero_curved = ref / time;					//교차로 회전시 모터 딜레이
+			for_curve_times = (8 * ref) / (3 * time);	//교차로 회전시 for문 반복 횟수
+			sensor = SENSOR_PORT & 0x0F;				//센서담당 포트 0x0f로 마스킹
+
+			switch (sensor) {
+			case 0x0f: 	//	Sensor 1, 2, 3, 4 On -> 전부 흰색 -> 직진	//"15"	□□□□
+				stepright = RIGHTmotorOneClock(stepright, 1);
+				stepleft = LEFTmotorOneClock(stepleft, 0);
+				delay(n);
+				break;
+			case 0x0b:	//	Sensor 3 OFF -> Turn Right					//"11"	□□■□
+				stepleft = LEFTmotorOneClock(stepleft, 0);
+				delay(n);
+				break;
+			case 0x0d:  //	Sensor 2 OFF -> Turn Left					//"13"	□■□□
+				stepright = RIGHTmotorOneClock(stepright, 1);
+				delay(n);
+				break;
+
+			case 0x03:	//	예외 경우 보정 Sensor3, 4 OFF -> Turn Right	// "3"	□□■■
+				stepleft = LEFTmotorOneClock(stepleft, 0);
+				delay(n);
+				break;
+
+			case 0x0c:	//	예외 경우 보정 Sensor1, 2 OFF -> Turn Left	// "12"	■■□□
+				stepright = RIGHTmotorOneClock(stepright, 1);
+				delay(n);
+				break;
+
+			case 0x07:	//	우회전 신호 인식 Sensor 4 OFF	//	"7"	□□□■
+				turn_sign--;
+				stepright = RIGHTmotorOneClock(stepright, 1);
+				stepleft = LEFTmotorOneClock(stepleft, 0);
+				delay(n);
+				break;
+			case 0x0a:	//	보정중인 상태에서 좌회전 신호 만날 때 Sensor1, 3 OFf	// "10"	■□■□
+				turn_sign++;
+				stepright = RIGHTmotorOneClock(stepright, 1);
+				stepleft = LEFTmotorOneClock(stepleft, 0);
+				delay(n);
+				break;
+			case 0x0e:	//	좌회전 신호 인식 Sensor 1 OFF	//	"14" ■□□□
+				turn_sign++;
+				stepright = RIGHTmotorOneClock(stepright, 1);
+				stepleft = LEFTmotorOneClock(stepleft, 0);
+				delay(n);
+				break;
+			case 0x05:	//	보정중인 상태에서 우회전 신호 만날 때 Sensor2, 4 OFF	//	"5"	□■□■
+				turn_sign--;
+				stepright = RIGHTmotorOneClock(stepright, 1);
+				stepleft = LEFTmotorOneClock(stepleft, 0);
+				delay(n);
+				break;
+			case 0x06:	//	정지 신호 Sensor1, 4 OFF	//	"6"	■□□■
+				stop_sign++;
+
+				if (stop_sign >= 3)		//정지신호 3회 인식 시
+				{
+					start_sign = 0;		//정지 및
+					stop_sign = 0;		//정지 신호 카운터 초기화
+				}
+				
+				//정지신호를 만난 뒤 직진해야 할 때까지 반복
+				//정지신호 1화 만난 후 다음 정지신호까지 stop_sign은 증가하지 않음
+				while ((sensor != 0x0f) && (sensor != 0x0b) && (sensor != 0x0d))
+				{
+					//직진하면서 보정하는 코드
+					if (sensor == 0x0b)
+					{
+						sensor = SENSOR_PORT & 0x0F;
+						stepleft = LEFTmotorOneClock(stepleft, 0);
+						delay(n);
+						MOTOR_PORT = stepleft | stepright;
+					}
+					else if (sensor == 0x0d)
+					{
+						sensor = SENSOR_PORT & 0x0F;
+						stepright = RIGHTmotorOneClock(stepright, 1);
+						delay(n);
+						MOTOR_PORT = stepleft | stepright;
+					}
+					else
+					{
+						sensor = SENSOR_PORT & 0x0F;
+						stepright = RIGHTmotorOneClock(stepright, 1);
+						stepleft = LEFTmotorOneClock(stepleft, 0);
+						delay(n);
+						MOTOR_PORT = stepleft | stepright;
+					}
+				}
+				break;
+
+			case 0x00:	//"0"	■■■■
+
+				if (turn_sign < -3)		//우회전 신호를 지속적으로 받아 (2cm * 2cm동안) 카운터가 -3보다 작아졌을 경우
+				{
+					//우회전 : 2.8 * (8 * ref) / (3 * time) : 실험을 통해 얻어낸 안정적 회전비율의 time에 대한 함수
+					for (i = 0; i < 2.8 * for_curve_times; i++)
+					{
+						stepleft = LEFTmotorOneClock(stepleft, 0);
+						delay(zero_curved);			//time * zero_curved = 1400, 1500
+						MOTOR_PORT = stepleft | stepright;
+					}
+					turn_sign = 0;		//카운터 초기화
+				}
+
+				else if (turn_sign > 3)	//좌회전 신호를 지속적으로 받아 카운터가 3보다 커졌을 경우
+				{
+					//좌회전 : 2.8 * (8 * ref) / (3 * time)
+					for (i = 0; i < 2.8 * for_curve_times; i++)
+					{
+						stepright = RIGHTmotorOneClock(stepright, 1);
+						delay(zero_curved);			//time * zero_curved = 1400, 1500
+						MOTOR_PORT = stepleft | stepright;
+					}
+					turn_sign = 0;		//카운터 초기화
+				}
+
+				else					//좌회전, 우회전 신호를 받지 못했을 경우 직진
+					for (i = 0; i < 100; i++)
+					{
+						stepright = RIGHTmotorOneClock(stepright, 1);
+						stepleft = LEFTmotorOneClock(stepleft, 0);
+						delay(n);
+						MOTOR_PORT = stepleft | stepright;
+					}
+
+
+				break;
+
+			default:    
+				stepright = RIGHTmotorOneClock(stepright, 1);
+				stepleft = LEFTmotorOneClock(stepleft, 0);
+				delay(n);
+				break;
+			}
+			MOTOR_PORT = stepleft | stepright;	//모터드라이브에 설정한 신호 공급
+		}
+}
+
+ISR(INT4_vect)
+{
+	//카운터 초기화 및 재시작
+	start_sign = 1;
+	stop_sign = 0;
+	turn_sign = 0;
+}
